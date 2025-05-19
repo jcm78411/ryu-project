@@ -1,0 +1,71 @@
+def balancear_trafico(self, datapath, dst):
+    dpid = datapath.id
+    ofproto = datapath.ofproto
+
+    # Si no hay estadísticas, usar round-robin
+    if dpid not in self.metrics["switches"]:
+        if dpid not in self.port_iterator:
+            self.port_iterator[dpid] = itertools.cycle(range(1, 50))
+        return next(self.port_iterator[dpid])
+
+    puertos_estadisticas = self.metrics["switches"][dpid]
+    feature_vector = []
+
+    for port, data in puertos_estadisticas.items():
+        delta_tx_bytes = data.get("delta_tx_bytes", 0)
+        delta_rx_bytes = data.get("delta_rx_bytes", 0)
+        delta_tx_packets = data.get("delta_tx_packets", 0)
+        delta_rx_packets = data.get("delta_rx_packets", 0)
+        latency = data.get("latency", 0)  # si tienes esta métrica
+
+        # Concatenar métricas por puerto al vector de características
+        feature_vector.extend([
+            delta_tx_bytes,
+            delta_rx_bytes,
+            delta_tx_packets,
+            delta_rx_packets,
+            latency
+        ])
+
+    # Paso 1: Predicción con modelo (puede ser una función de ML o heurística)
+    if self.predict_congestion(feature_vector):
+        # Aplicar QoS si hay congestión
+        return self._apply_qos(datapath, {}, 10, queue_id=1)
+
+    # Paso 2: Elegir el puerto con menos carga actual (bytes transmitidos recientemente)
+    puerto_optimo = min(
+        puertos_estadisticas.items(),
+        key=lambda item: item[1].get("delta_tx_bytes", float('inf')),
+        default=(ofproto.OFPP_FLOOD, {})
+    )[0]
+
+    return puerto_optimo
+
+
+
+
+
+
+
+
+for nombre, modelo in modelos.items():
+    model = Pipeline([("scaler", RobustScaler()), ("clf", modelo)])
+    model.fit(X_train, y_train)
+
+    y_pred = model.predict(X_test)
+    accuracy = model.score(X_test, y_test)
+
+    print(f"\nModelo: {nombre}")
+    print(f"Accuracy: {accuracy}")
+    print("Predicciones únicas:", np.unique(y_pred, return_counts=True))
+    print(classification_report(y_test, y_pred))
+
+    cm = confusion_matrix(y_test, y_pred)
+
+    plt.figure(figsize=(6, 4))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", cbar=False)
+    plt.title(f"{nombre} - Matriz de Confusión\nAccuracy: {round(accuracy, 4)*100}%")
+    plt.xlabel("Predicción")
+    plt.ylabel("Real")
+    plt.tight_layout()
+    plt.show()

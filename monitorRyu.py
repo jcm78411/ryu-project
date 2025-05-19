@@ -24,16 +24,24 @@ class LoadBalancerQoS:
         self.port_iterator = {}
         self.metrics = metrics  # Usamos los mismos metrics que el controlador
         self.echo_timestamps = {}
-        self.model = joblib.load("traffic_predictor.pkl")
+        self.model = joblib.load("predictor.pkl")
 
     def predict_congestion(self, features):
         features = np.array(features).reshape(1, -1)
         return self.model.predict(features)[0]
 
+    def actualizar_latencia(self, dpid):
+        latency = 0
+        if switch := self.metrics["switches"].get(dpid):
+            for port in switch.values():
+                port["latency"] = latency
+
+
     def balancear_trafico(self, datapath, dst):
         dpid = datapath.id
         ofproto = datapath.ofproto
 
+        # Si no hay estadísticas, usar round-robin
         if dpid not in self.metrics["switches"]:
             if dpid not in self.port_iterator:
                 self.port_iterator[dpid] = itertools.cycle(
@@ -44,57 +52,70 @@ class LoadBalancerQoS:
         puertos_estadisticas = self.metrics["switches"].get(dpid, {})
         traffic_features = []
         
-        # Cálculo de características con diferencias (para ancho de banda)
+        latency = self.actualizar_latencia(dpid)
+        # tx_bytes,rx_bytes,tx_packets,rx_packets,latency,congestion
         for port, data in puertos_estadisticas.items():
-            current_tx = data.get("tx_bytes", 0)
-            current_rx = data.get("rx_bytes", 0)
-            
-            # Obtener valores anteriores
-            prev_stats = data.get("prev_stats", {"tx_bytes": 0, "rx_bytes": 0})
-            tx_diff = current_tx - prev_stats["tx_bytes"]
-            rx_diff = current_rx - prev_stats["rx_bytes"]
-            
-            traffic_features.extend([tx_diff, rx_diff, data.get("latency", 0)])
-            data["prev_stats"] = {"tx_bytes": current_tx, "rx_bytes": current_rx}  # Actualizar histórico
+            tx_bytes = data.get("tx_bytes", 0)
+            rx_bytes = data.get("rx_bytes", 0)
+            tx_packets = data.get("tx_packets", 0)
+            rx_packets = data.get("rx_packets", 0)
+            latency = int(data.get("latency", 0))
 
-        if congestion := self.predict_congestion(traffic_features):
+            # Concatenar métricas por puerto al vector de características
+            traffic_features.extend([
+                tx_bytes,
+                rx_bytes,
+                tx_packets,
+                rx_packets,
+                latency
+            ])
+
+        # Paso 1: Predicción con modelo (puede ser una función de ML o heurística)
+        if self.predict_congestion(traffic_features):
+            print("="*100)
+            print("="*100)
+            print("="*100)
+
+            print(traffic_features)
+
+            print("="*100)
+            print("="*100)
+            print("="*100)
+
+            # Aplicar QoS si hay congestión
             return self._apply_qos(datapath, {}, 10, queue_id=1)
 
-        return min(
+        # Paso 2: Elegir el puerto con menos carga actual (bytes transmitidos recientemente)
+        puerto_optimo = min(
             puertos_estadisticas.items(),
             key=lambda item: item[1].get("tx_bytes", float('inf')),
             default=(ofproto.OFPP_FLOOD, {})
         )[0]
 
+        return puerto_optimo
+
     def _apply_qos(self, datapath, match_fields, priority, queue_id):
-        # Configuración de 3 colas con QoS
+        
         parser = datapath.ofproto_parser
         ofproto = datapath.ofproto
-        
-        # Configurar colas al conectar el switch
-        if datapath.id not in self.metrics.get("qos_configured", []):
-            for queue_id, bandwidth in [(0, 70), (1, 20), (2, 10)]:
-                req = parser.OFPQueueSetConfigRequest(
-                    datapath=datapath,
-                    port=ofproto.OFPP_ANY,
-                    queues=[parser.OFPQueueConfig(queue_id, rate=bandwidth)]
-                )
-                datapath.send_msg(req)
-            self.metrics.setdefault("qos_configured", []).append(datapath.id)
 
-        # Crear regla de flujo
-        actions = [parser.OFPActionSetQueue(queue_id),
-                 parser.OFPActionOutput(ofproto.OFPP_NORMAL)]
-        
+        # Crear regla de flujo con cola preconfigurada
+        actions = [
+            parser.OFPActionSetQueue(queue_id),
+            parser.OFPActionOutput(ofproto.OFPP_NORMAL)
+        ]
+
+        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
+
         flow_mod = parser.OFPFlowMod(
             datapath=datapath,
             priority=priority,
             match=parser.OFPMatch(**match_fields),
-            instructions=[parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
+            instructions=inst
         )
         datapath.send_msg(flow_mod)
-        
-        # Limitar notificaciones a 10 elementos
+
+        # Limitar notificaciones a los últimos 10 elementos
         notification = {
             "timestamp": time.strftime('%Y-%m-%d %H:%M:%S'),
             "title": f"QoS: Cola {queue_id}",
@@ -104,16 +125,13 @@ class LoadBalancerQoS:
 
         return queue_id
 
+
     def enviar_echo_request(self, datapath):
         parser = datapath.ofproto_parser
         self.echo_timestamps[datapath.id] = time.time()
         echo_req = parser.OFPEchoRequest(datapath, data=b"latency_check")
         datapath.send_msg(echo_req)
         
-    def actualizar_latencia(self, dpid, latency):
-        if switch := self.metrics["switches"].get(dpid):
-            for port in switch.values():
-                port["latency"] = latency
 
 # ------------------------- Controlador Principal Modificado -------------------------
 class RyuManagerCustomSDN(app_manager.RyuApp):
@@ -145,10 +163,21 @@ class RyuManagerCustomSDN(app_manager.RyuApp):
             with open(self.csv_filename, 'w', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow([
-                    'timestamp', 'switch_id', 'port', 
-                    'tx_rate_mbps', 'rx_rate_mbps', 'latency_ms',
-                    'cpu_usage', 'mem_usage', 'dst_ip',
-                    'qos_queue', 'predicted_congestion'
+                    #'timestamp', 
+                    #'switch_id', 
+                    #'port', 
+                    #'tx_rate',
+                    #'rx_rate',
+                    'tx_bytes', 
+                    'rx_bytes', 
+                    'tx_packets', 
+                    'rx_packets',
+                    'latency',
+                    #'cpu_usage', 
+                    #'mem_usage', 
+                    #'dst_ip',
+                    #'qos_queue', 
+                    #'predicted_congestion'
                 ])
     
     def _log_traffic_data(self, dpid, port_stats, dst_ip=None):
@@ -159,24 +188,33 @@ class RyuManagerCustomSDN(app_manager.RyuApp):
             with open(self.csv_filename, 'a', newline='') as f:
                 writer = csv.writer(f)
                 
+                latencya = self.load_balancer.actualizar_latencia(dpid)
                 for port, stats in port_stats.items():
-                    # Calcular valores relevantes
-                    tx_rate = (stats.get('tx_rate', 0) * 8) / 1e6  # Mbps
-                    rx_rate = (stats.get('rx_rate', 0) * 8) / 1e6  # Mbps
-                    latency = stats.get('latency', 0) * 1000  # ms
+                    # Calcular valores relevantes  
+                    tx_rate = stats.get('tx_bytes', 0) / 1024
+                    rx_rate = stats.get('rx_bytes', 0) / 1024
+                    tx_bytes = stats.get("tx_bytes", 0)
+                    rx_bytes = stats.get("rx_bytes", 0)
+                    tx_packets = stats.get("tx_packets", 0)
+                    rx_packets = stats.get("rx_packets", 0)
+                    latency = int(stats.get("latency", 0))
                     
                     writer.writerow([
-                        timestamp,
-                        dpid,
-                        port,
-                        f"{tx_rate:.2f}",
-                        f"{rx_rate:.2f}",
+                        #timestamp,
+                        #dpid,
+                        #port,
+                        #f"{tx_rate:.2f}",
+                        #f"{rx_rate:.2f}",
+                        f"{tx_bytes}",
+                        f"{rx_bytes}",
+                        f"{tx_packets}",
+                        f"{rx_packets}",
                         f"{latency:.2f}",
-                        self.metrics['cpu'],
-                        self.metrics['memory'],
-                        dst_ip or 'N/A',
-                        stats.get('qos_queue', 'N/A'),
-                        stats.get('congestion_prediction', 'N/A')
+                        #self.metrics['cpu'],
+                        #self.metrics['memory'],
+                        #dst_ip or 'N/A',
+                        #stats.get('qos_queue', 'N/A'),
+                        #stats.get('congestion_prediction', 'N/A')
                     ])
                     
     def start_http_server(self):
@@ -338,7 +376,7 @@ class RyuManagerCustomSDN(app_manager.RyuApp):
         parser = datapath.ofproto_parser
         
         
-        self._apply_qos(datapath=datapath, match_fields={}, priority=1, queue_id=0)
+        self.load_balancer._apply_qos(datapath=datapath, match_fields={}, priority=1, queue_id=0)
 
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
@@ -356,26 +394,48 @@ class RyuManagerCustomSDN(app_manager.RyuApp):
         
     @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
     def port_stats_reply_handler(self, ev):
-        # Cálculo de ancho de banda con diferencias
         body = ev.msg.body
         dpid = ev.msg.datapath.id
-        
+
+        # Asegurar estructuras de almacenamiento
+        switch_stats = self.metrics.setdefault("switches", {})
+        port_data = switch_stats.setdefault(dpid, {})
+
         for stat in body:
-            port_stats = self.metrics["switches"].setdefault(dpid, {}).setdefault(stat.port_no, {})
-            
-            # Calcular diferencias
-            tx_diff = stat.tx_bytes - port_stats.get("last_tx", 0)
-            rx_diff = stat.rx_bytes - port_stats.get("last_rx", 0)
-            
-            # Actualizar métricas
+            port_no = stat.port_no
+            port_stats = port_data.setdefault(port_no, {})
+
+            # Calcular diferencias desde la última medición
+            tx_bytes_prev = port_stats.get("tx_bytes", 0)
+            rx_bytes_prev = port_stats.get("rx_bytes", 0)
+            tx_pkts_prev = port_stats.get("tx_packets", 0)
+            rx_pkts_prev = port_stats.get("rx_packets", 0)
+
+            # Diferencias (delta) para monitoreo reciente
+            tx_bytes_diff = stat.tx_bytes - tx_bytes_prev
+            rx_bytes_diff = stat.rx_bytes - rx_bytes_prev
+            tx_pkts_diff = stat.tx_packets - tx_pkts_prev
+            rx_pkts_diff = stat.rx_packets - rx_pkts_prev
+
+            # Guardar los nuevos valores acumulados
             port_stats.update({
                 "tx_bytes": stat.tx_bytes,
                 "rx_bytes": stat.rx_bytes,
-                "tx_rate": tx_diff,
-                "rx_rate": rx_diff,
-                "last_tx": stat.tx_bytes,
-                "last_rx": stat.rx_bytes
+                "tx_packets": stat.tx_packets,
+                "rx_packets": stat.rx_packets,
+                "delta_tx_bytes": tx_bytes_diff,
+                "delta_rx_bytes": rx_bytes_diff,
+                "delta_tx_packets": tx_pkts_diff,
+                "delta_rx_packets": rx_pkts_diff,
             })
+
+            # Log (opcional)
+            self.logger.info(
+                "Switch %s, Port %s - TX: %d bytes (%d pkts), RX: %d bytes (%d pkts)",
+                dpid, port_no,
+                tx_bytes_diff, tx_pkts_diff,
+                rx_bytes_diff, rx_pkts_diff
+            )
 
     def add_table_miss_flow(self, datapath):
         ofproto = datapath.ofproto
