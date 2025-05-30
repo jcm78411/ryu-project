@@ -25,10 +25,35 @@ Este proyecto implementa un sistema de monitoreo y gestión de tráfico en redes
 # Clona el repositorio
 git clone https://github.com/jcm78411/ryu-project.git
 cd ryu-project
+```
 
-# Crea entorno virtual
-python -m venv venv
-venv\Scripts\activate  # o source venv/bin/activate en Linux
+# Crea el entorno virtual
+```bash
+python -m venv .venv
+```
+
+# Activa el entorno virtual en Windows con
+```bash
+.venv\Scripts\activate
+```
+
+# O si estás en Linux/MacOS con
+```bash
+source .venv/bin/activate
+```
 
 # Instala dependencias
+
+```bash
 pip install -r requirements.txt
+```
+
+# Recuerda instalar las herramientas necesarias antes...
+
+# Y tambien si te da algún error de politica de ejecucion de scripts:
+
+# En una terminal de Windows ejecuta:
+
+```bash
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+```
