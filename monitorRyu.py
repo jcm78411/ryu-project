@@ -33,7 +33,7 @@ class LoadBalancerQoS:
         return self.model.predict(features)[0]
 
     def actualizar_latencia(self, dpid):
-        latency = random.uniform(1, 600)  # Latencia simulada entre 1 y 600 ms
+        latency = random.uniform(1, 100)  # Latencia simulada entre 1 y 600 ms
         if switch := self.metrics["switches"].get(dpid):
             for port in switch.values():
                 port["latency"] = latency
