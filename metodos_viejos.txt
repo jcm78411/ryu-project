@@ -1,0 +1,333 @@
+
+    def predict_congestion(self, features):
+        features = np.array(features).reshape(1, -1)
+        return self.model.predict(features)[0]
+
+    def actualizar_latencia(self, dpid):
+        try:
+            output = subprocess.check_output(['ping', '-c', '1', '10.0.0.2'], timeout=1).decode()
+            for line in output.splitlines():
+                if "time=" in line:
+                    latency_str = line.split("time=")[-1].split(" ")[0]
+                    latency = float(latency_str)
+                    break
+            else:
+                latency = 0.0
+        except Exception:
+            latency = 0.0
+
+        if switch := self.metrics["switches"].get(dpid):
+            for port in switch.values():
+                port["latency"] = latency
+        return latency
+    
+    def balancear_trafico(self, datapath, dst):
+        dpid = datapath.id
+        ofproto = datapath.ofproto
+
+        # Si no hay estadísticas, usar round-robin
+        if dpid not in self.metrics["switches"]:
+            if dpid not in self.port_iterator:
+                self.port_iterator[dpid] = itertools.cycle(
+                    port for port in range(1, 50)
+                )
+            return next(self.port_iterator[dpid])
+      
+        puertos_estadisticas = self.metrics["switches"].get(dpid, {})
+        traffic_features = []
+        
+        latency = self.actualizar_latencia(dpid)
+        # tx_bytes,rx_bytes,tx_packets,rx_packets,latency,congestion
+        for port, data in puertos_estadisticas.items():
+            tx_bytes = data.get("tx_bytes", 0)
+            rx_bytes = data.get("rx_bytes", 0)
+            tx_packets = data.get("tx_packets", 0)
+            rx_packets = data.get("rx_packets", 0)
+            latency = int(data.get("latency", 0))
+
+            # Concatenar métricas por puerto al vector de características
+            traffic_features.extend([
+                tx_bytes,
+                rx_bytes,
+                tx_packets,
+                rx_packets,
+                latency
+            ])
+
+        # Paso 1: Predicción con modelo (puede ser una función de ML o heurística)
+        if self.predict_congestion(traffic_features):
+            print("="*100)
+            print("="*100)
+            print("="*100)
+
+            print(traffic_features)
+
+            print("="*100)
+            print("="*100)
+            print("="*100)
+
+            # Aplicar QoS si hay congestión
+            return self._apply_qos(datapath, {}, 10, queue_id=1)
+
+        # Paso 2: Elegir el puerto con menos carga actual (bytes transmitidos recientemente)
+        puerto_optimo = min(
+            puertos_estadisticas.items(),
+            key=lambda item: item[1].get("tx_bytes", float('inf')),
+            default=(ofproto.OFPP_FLOOD, {})
+        )[0]
+
+        return puerto_optimo
+      
+    def _apply_qos(self, datapath, match_fields, priority, queue_id):
+        
+        parser = datapath.ofproto_parser
+        ofproto = datapath.ofproto
+
+        # Crear regla de flujo con cola preconfigurada
+        actions = [
+            parser.OFPActionSetQueue(queue_id),
+            parser.OFPActionOutput(ofproto.OFPP_NORMAL)
+        ]
+
+        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
+
+        flow_mod = parser.OFPFlowMod(
+            datapath=datapath,
+            priority=priority,
+            match=parser.OFPMatch(**match_fields),
+            instructions=inst
+        )
+        datapath.send_msg(flow_mod)
+
+        # Limitar notificaciones a los últimos 10 elementos
+        notification = {
+            "timestamp": time.strftime('%Y-%m-%d %H:%M:%S'),
+            "title": f"QoS: Cola {queue_id}",
+            "description": f"Tráfico asignado a cola {queue_id}"
+        }
+        self.metrics["notifications"] = (self.metrics["notifications"] + [notification])[-10:]
+
+        return queue_id
+    
+    @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
+    def _packet_in_handler(self, ev):
+        self.logger.info("[DEBUG] Entró al handler PacketIn")
+        msg = ev.msg
+        datapath = msg.datapath
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+
+        dpid = datapath.id
+        self.mac_to_port.setdefault(dpid, {})
+
+        pkt = packet.Packet(msg.data)
+        eth_pkt = pkt.get_protocol(ethernet.ethernet)
+
+        if eth_pkt is None:
+            return
+
+        dst = eth_pkt.dst
+        src = eth_pkt.src
+
+        in_port = msg.match['in_port']
+        self.logger.info("Packet in: DPID=%s, SRC=%s, DST=%s, IN_PORT=%s", dpid, src, dst, in_port)
+
+        if not eth_pkt.dst.startswith("ff:ff:ff:ff:ff:ff"):
+            self._register_device(dpid, in_port, eth_pkt.src, pkt)
+
+        self.mac_to_port[dpid][src] = in_port
+
+        print(f"[Handler] Llamando a balancear_trafico para DPID {dpid}, destino {dst}")
+        # Llamar al balanceador de carga para determinar el puerto de salida
+        self.load_balancer.enviar_echo_request(datapath)  # Enviar Echo Request para medir latencia
+        # Determinar el puerto de salida usando el balanceador de carga
+        self.logger.info("Balanceando tráfico para DPID=%s, destino=%s", dpid, dst)
+        out_port = self.load_balancer.balancear_trafico(datapath, dst)
+
+        actions = [parser.OFPActionOutput(out_port)]
+
+        if out_port != ofproto.OFPP_FLOOD:
+            match = parser.OFPMatch(in_port=in_port, eth_dst=dst, eth_src=src)
+            self.add_flow(datapath, 1, match, actions)
+
+        out = parser.OFPPacketOut(
+            datapath=datapath,
+            buffer_id=msg.buffer_id,
+            in_port=in_port,
+            actions=actions,
+            data=msg.data if msg.buffer_id == ofproto.OFP_NO_BUFFER else None
+        )
+        datapath.send_msg(out)
+        
+        # Obtener IP destino si existe
+        dst_ip = 'N/A'
+        ip_pkt = pkt.get_protocol(ipv4.ipv4)
+        if ip_pkt:
+            dst_ip = ip_pkt.dst
+        
+        # Registrar en CSV con contexto de paquete
+        self._log_traffic_data(
+            dpid=dpid,
+            port_stats=self.metrics["switches"].get(dpid, {}),
+            dst_ip=dst_ip
+        )
+    
+    @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
+    def switch_features_handler(self, ev):
+        datapath = ev.msg.datapath
+        self.add_table_miss_flow(datapath)
+        # ofproto = datapath.ofproto
+        # parser = datapath.ofproto_parser
+        
+        ofproto = datapath.ofproto
+        self.load_balancer._apply_qos(datapath=datapath, match_fields={}, priority=1, queue_id=0, out_port=ofproto.OFPP_FLOOD)
+
+        # match = parser.OFPMatch()
+        # actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
+          #                                 ofproto.OFPCML_NO_BUFFER)]
+        # self.add_flow(datapath, 0, match, actions)
+
+        self._request_stats(datapath)
+
+    def balancear_trafico(self, datapath, dst):
+        print(f"\n[BALANCEADOR] Método balancear_trafico llamado para switch {datapath.id}, destino: {dst}")
+        dpid = datapath.id
+        ofproto = datapath.ofproto
+
+        print(f"\n[INFO] Evaluando balanceo para switch {dpid}, destino: {dst}")
+
+        # Si no hay estadísticas aún, usar round-robin
+        if dpid not in self.metrics["switches"]:
+            print(f"[ROUND-ROBIN] No hay estadísticas para el switch {dpid}, usando round-robin.")
+            if dpid not in self.port_iterator:
+                self.port_iterator[dpid] = itertools.cycle(
+                    port for port in range(1, 50)
+                )
+            selected_port = next(self.port_iterator[dpid])
+            print(f"[ROUND-ROBIN] Puerto seleccionado: {selected_port}")
+            return selected_port
+
+        puertos_estadisticas = self.metrics["switches"].get(dpid, {})
+        traffic_features = []
+
+        # Lógica de latencia
+        latency = self.actualizar_latencia(dpid)
+
+        print(f"[STATS] Recolectando métricas de puertos en switch {dpid}")
+        for port, data in puertos_estadisticas.items():
+            tx_bytes = data.get("tx_bytes", 0)
+            rx_bytes = data.get("rx_bytes", 0)
+            tx_packets = data.get("tx_packets", 0)
+            rx_packets = data.get("rx_packets", 0)
+            latency = int(data.get("latency", 0))
+
+            print(f"  - Puerto {port}: TX={tx_bytes}B RX={rx_bytes}B TXp={tx_packets} RXp={rx_packets} Lat={latency}ms")
+
+            traffic_features.extend([
+                tx_bytes,
+                rx_bytes,
+                tx_packets,
+                rx_packets,
+                latency
+            ])
+
+        # Paso 1: Predicción con modelo (ML o heurístico)
+        """ if self.predict_congestion(traffic_features):
+            print("\n[CONGESTIÓN DETECTADA] Activando balanceo con QoS en switch", dpid)
+            print(f"[FEATURES] Vector de entrada: {traffic_features}") """
+        
+        congestion = self.predict_congestion(traffic_features)
+        print(f"[Predict] Features: {traffic_features}, Congestion: {congestion}")
+        if congestion:
+            print("[Predict] Congestion detected! Please apply QoS...")
+            #return self._apply_qos(datapath, {}, 10, queue_id=1, out_port=out_port)
+        else:
+            print("[Predict] No congestion, using best port...")
+
+        # Paso 2: Elegir puerto con menor tx_bytes
+        puerto_optimo, datos = min(
+            puertos_estadisticas.items(),
+            key=lambda item: item[1].get("tx_bytes", float('inf')),
+            default=(ofproto.OFPP_FLOOD, {})
+        )
+
+        print(f"[BALANCEO NORMAL] Puerto con menor carga (TX): {puerto_optimo}")
+        return puerto_optimo
+
+
+
+
+
+
+        def balancear_trafico(self, datapath, dst):
+        print(f"\n[BALANCEADOR] Método balancear_trafico llamado para switch {datapath.id}, destino: {dst}")
+        dpid = datapath.id
+        ofproto = datapath.ofproto
+
+        print(f"\n[INFO] Evaluando balanceo para switch {dpid}, destino: {dst}")
+
+        # Si no hay estadísticas aún, usar round-robin
+        if dpid not in self.metrics["switches"]:
+            print(f"[ROUND-ROBIN] No hay estadísticas para el switch {dpid}, usando round-robin.")
+            if dpid not in self.port_iterator:
+                self.port_iterator[dpid] = itertools.cycle(
+                    port for port in range(1, 50)
+                )
+            selected_port = next(self.port_iterator[dpid])
+            print(f"[ROUND-ROBIN] Puerto seleccionado: {selected_port}")
+            return selected_port
+
+        puertos_estadisticas = self.metrics["switches"].get(dpid, {})
+        traffic_features = []
+
+        # Lógica de latencia
+        latency = self.actualizar_latencia(dpid)
+
+        print(f"[STATS] Recolectando métricas de puertos en switch {dpid}")
+        puertos_validos = {}
+
+        for port, data in puertos_estadisticas.items():
+            if port >= 0xFFFFFF00:  # Ignorar puertos reservados
+                continue
+
+            tx_bytes = data.get("tx_bytes", 0)
+            rx_bytes = data.get("rx_bytes", 0)
+            tx_packets = data.get("tx_packets", 0)
+            rx_packets = data.get("rx_packets", 0)
+            latency = int(data.get("latency", 0))
+
+            print(f"  - Puerto {port}: TX={tx_bytes}B RX={rx_bytes}B TXp={tx_packets} RXp={rx_packets} Lat={latency}ms")
+
+            traffic_features.extend([
+                tx_bytes,
+                rx_bytes,
+                tx_packets,
+                rx_packets,
+                latency
+            ])
+
+            puertos_validos[port] = data  # Solo agregar puertos válidos
+
+        # Verificar si hay puertos válidos
+        if not puertos_validos:
+            print("[ERROR] No hay puertos físicos válidos para balancear. Usando OFPP_FLOOD.")
+            return ofproto.OFPP_FLOOD
+
+        congestion = self.predict_congestion(traffic_features)
+        print(f"[Predict] Features: {traffic_features}, Congestion: {congestion}")
+        if congestion:
+            print("[Predict] Congestion detected! Please apply QoS...")
+            # Aquí puedes retornar un puerto específico o aplicar política QoS
+            # Ejemplo: return self._apply_qos(...)
+
+        else:
+            print("[Predict] No congestion, using best port...")
+
+        # Elegir puerto con menor carga TX entre los válidos
+        puerto_optimo, datos = min(
+            puertos_validos.items(),
+            key=lambda item: item[1].get("tx_bytes", float('inf'))
+        )
+
+        print(f"[BALANCEO NORMAL] Puerto con menor carga (TX): {puerto_optimo}")
+        return puerto_optimo

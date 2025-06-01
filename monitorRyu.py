@@ -17,12 +17,14 @@ import numpy as np
 import csv
 import os
 from threading import Lock
+import subprocess
+import random
 
 # ------------------------- Clase LoadBalancerQoS Integrada -------------------------
 class LoadBalancerQoS:
     def __init__(self, metrics):
         self.port_iterator = {}
-        self.metrics = metrics  # Usamos los mismos metrics que el controlador
+        self.metrics = metrics
         self.echo_timestamps = {}
         self.model = joblib.load("predictor.pkl")
 
@@ -31,78 +33,75 @@ class LoadBalancerQoS:
         return self.model.predict(features)[0]
 
     def actualizar_latencia(self, dpid):
-        latency = 0
+        latency = random.uniform(1, 600)  # Latencia simulada entre 1 y 600 ms
         if switch := self.metrics["switches"].get(dpid):
             for port in switch.values():
                 port["latency"] = latency
+        return int(latency)
 
-
-    def balancear_trafico(self, datapath, dst):
+    def balancear_trafico(self, datapath, dst, in_port=None):
+        print(f"\n[BALANCEADOR] Método balancear_trafico llamado para switch {datapath.id}, destino: {dst}")
         dpid = datapath.id
         ofproto = datapath.ofproto
 
-        # Si no hay estadísticas, usar round-robin
+        print(f"\n[INFO] Evaluando balanceo para switch {dpid}, destino: {dst}")
+
         if dpid not in self.metrics["switches"]:
+            print(f"[ROUND-ROBIN] No hay estadísticas para el switch {dpid}, usando round-robin.")
             if dpid not in self.port_iterator:
                 self.port_iterator[dpid] = itertools.cycle(
                     port for port in range(1, 50)
                 )
-            return next(self.port_iterator[dpid])
-      
+            selected_port = next(self.port_iterator[dpid])
+            print(f"[ROUND-ROBIN] Puerto seleccionado: {selected_port}")
+            return selected_port
+
         puertos_estadisticas = self.metrics["switches"].get(dpid, {})
-        traffic_features = []
-        
-        latency = self.actualizar_latencia(dpid)
-        # tx_bytes,rx_bytes,tx_packets,rx_packets,latency,congestion
-        for port, data in puertos_estadisticas.items():
-            tx_bytes = data.get("tx_bytes", 0)
-            rx_bytes = data.get("rx_bytes", 0)
-            tx_packets = data.get("tx_packets", 0)
-            rx_packets = data.get("rx_packets", 0)
-            latency = int(data.get("latency", 0))
 
-            # Concatenar métricas por puerto al vector de características
-            traffic_features.extend([
-                tx_bytes,
-                rx_bytes,
-                tx_packets,
-                rx_packets,
-                latency
-            ])
-
-        # Paso 1: Predicción con modelo (puede ser una función de ML o heurística)
-        if self.predict_congestion(traffic_features):
-            print("="*100)
-            print("="*100)
-            print("="*100)
-
-            print(traffic_features)
-
-            print("="*100)
-            print("="*100)
-            print("="*100)
-
-            # Aplicar QoS si hay congestión
-            return self._apply_qos(datapath, {}, 10, queue_id=1)
-
-        # Paso 2: Elegir el puerto con menos carga actual (bytes transmitidos recientemente)
-        puerto_optimo = min(
+        # Elegir un puerto a evaluar: por ejemplo, el que menos tx_bytes tiene
+        puerto_optimo, datos = min(
             puertos_estadisticas.items(),
             key=lambda item: item[1].get("tx_bytes", float('inf')),
             default=(ofproto.OFPP_FLOOD, {})
-        )[0]
+        )
+
+        tx_bytes = datos.get("tx_bytes", 0)
+        rx_bytes = datos.get("rx_bytes", 0)
+        tx_packets = datos.get("tx_packets", 0)
+        rx_packets = datos.get("rx_packets", 0)
+        latency = int(datos.get("latency", 0))
+
+        traffic_features = [
+            tx_bytes,
+            rx_bytes,
+            tx_packets,
+            rx_packets,
+            latency
+        ]
+
+        print(f"[STATS] Puerto {puerto_optimo}: TX={tx_bytes} RX={rx_bytes} TXp={tx_packets} RXp={rx_packets} Lat={latency}")
+        print(f"[Predict] Features: {traffic_features}")
+
+        congestion = self.predict_congestion(traffic_features)
+        print(f"[Predict] Congestion: {congestion}")
+        if congestion:
+            print("[Predict] Congestion detected! Please apply QoS...")
+        else:
+            print("[Predict] No congestion, using best port...")
 
         return puerto_optimo
 
-    def _apply_qos(self, datapath, match_fields, priority, queue_id):
-        
+    def _apply_qos(self, datapath, match_fields, priority, queue_id, out_port):
         parser = datapath.ofproto_parser
         ofproto = datapath.ofproto
 
-        # Crear regla de flujo con cola preconfigurada
+        if out_port in [0, datapath.ofproto.OFPP_LOCAL, 65534, "LOCAL", "local"]:
+            print(f"[QoS] No se aplica QoS a puerto virtual (out_port={out_port})")
+            return
+
         actions = [
             parser.OFPActionSetQueue(queue_id),
-            parser.OFPActionOutput(ofproto.OFPP_NORMAL)
+            parser.OFPActionOutput(out_port)
         ]
 
         inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
@@ -115,16 +114,14 @@ class LoadBalancerQoS:
         )
         datapath.send_msg(flow_mod)
 
-        # Limitar notificaciones a los últimos 10 elementos
         notification = {
             "timestamp": time.strftime('%Y-%m-%d %H:%M:%S'),
             "title": f"QoS: Cola {queue_id}",
-            "description": f"Tráfico asignado a cola {queue_id}"
+            "description": f"Tráfico asignado a cola {queue_id} en puerto {out_port}"
         }
         self.metrics["notifications"] = (self.metrics["notifications"] + [notification])[-10:]
 
         return queue_id
-
 
     def enviar_echo_request(self, datapath):
         parser = datapath.ofproto_parser
@@ -146,7 +143,8 @@ class RyuManagerCustomSDN(app_manager.RyuApp):
             "memory": 0,
             "switches": {},
             "devices": [],
-            "notifications": []
+            "notifications": [],
+            "switch_latency": {}
         }
         
         self.csv_lock = Lock()  # Lock para escritura segura en CSV
@@ -163,9 +161,9 @@ class RyuManagerCustomSDN(app_manager.RyuApp):
             with open(self.csv_filename, 'w', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow([
-                    #'timestamp', 
-                    #'switch_id', 
-                    #'port', 
+                    'timestamp', 
+                    'switch_id', 
+                    'port', 
                     #'tx_rate',
                     #'rx_rate',
                     'tx_bytes', 
@@ -173,14 +171,15 @@ class RyuManagerCustomSDN(app_manager.RyuApp):
                     'tx_packets', 
                     'rx_packets',
                     'latency',
-                    #'cpu_usage', 
-                    #'mem_usage', 
+                    'switch_latency',
+                    'cpu_usage', 
+                    'mem_usage', 
                     #'dst_ip',
                     #'qos_queue', 
                     #'predicted_congestion'
                 ])
     
-    def _log_traffic_data(self, dpid, port_stats, dst_ip=None):
+    def _log_traffic_data(self, dpid, port_stats, dst_ip):
         """Registrar métricas en archivo CSV"""
         timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
         
@@ -197,21 +196,25 @@ class RyuManagerCustomSDN(app_manager.RyuApp):
                     rx_bytes = stats.get("rx_bytes", 0)
                     tx_packets = stats.get("tx_packets", 0)
                     rx_packets = stats.get("rx_packets", 0)
-                    latency = int(stats.get("latency", 0))
+                    latency = int(latencya)
+                    dst_ip = stats.get('dst_ip', None)
+                    self.logger.info(f"[CSV] Registrando datos para DPID {dpid}, puerto {port}: ")
+                    switch_latency = self.metrics["switch_latency"].get(dpid, 0)
                     
                     writer.writerow([
-                        #timestamp,
-                        #dpid,
-                        #port,
+                        timestamp,
+                        dpid,
+                        port,
                         #f"{tx_rate:.2f}",
                         #f"{rx_rate:.2f}",
                         f"{tx_bytes}",
                         f"{rx_bytes}",
                         f"{tx_packets}",
                         f"{rx_packets}",
-                        f"{latency:.2f}",
-                        #self.metrics['cpu'],
-                        #self.metrics['memory'],
+                        f"{latency}",
+                        f"{switch_latency}",
+                        self.metrics['cpu'],
+                        self.metrics['memory'],
                         #dst_ip or 'N/A',
                         #stats.get('qos_queue', 'N/A'),
                         #stats.get('congestion_prediction', 'N/A')
@@ -226,7 +229,7 @@ class RyuManagerCustomSDN(app_manager.RyuApp):
                     k: v for k, v in self.metrics.items()
                     if k != "qos_configured"  # Excluir datos internos
                 })
-            app.run(host='0.0.0.0', port=5000)
+            app.run(host='0.0.0.0', port=5090)
         except Exception as e:
             self.logger.error("Error en servidor HTTP: %s", str(e))
             
@@ -234,11 +237,12 @@ class RyuManagerCustomSDN(app_manager.RyuApp):
         while True:
             for dp in self.datapaths.values():
                 self._request_stats(dp)
+                self.logger.info(f"Solicitando estadísticas de switch {dp}")
             self._log_system_stats()
             self._calculate_bandwidth()
             
             for dpid, port_stats in self.metrics["switches"].items():
-                self._log_traffic_data(dpid, port_stats)
+                self._log_traffic_data(dpid, port_stats, dst_ip=None)
                 
             hub.sleep(2)
 
@@ -247,8 +251,8 @@ class RyuManagerCustomSDN(app_manager.RyuApp):
         memory_info = psutil.virtual_memory()
         self.metrics["cpu"] = cpu_usage
         self.metrics["memory"] = memory_info.percent
-        self.logger.info('CPU Usage: %s%%', cpu_usage)
-        self.logger.info('Memory Usage: %s%% (%s MB used)', memory_info.percent, memory_info.used / (1024 ** 2))
+        #self.logger.info('CPU Usage: %s%%', cpu_usage)
+        #self.logger.info('Memory Usage: %s%% (%s MB used)', memory_info.percent, memory_info.used / (1024 ** 2))
 
     def _request_stats(self, datapath):
         ofproto = datapath.ofproto
@@ -268,10 +272,10 @@ class RyuManagerCustomSDN(app_manager.RyuApp):
                 for device in self.metrics["devices"]:
                     if device["switch"] == f"{str(switch_id)}" and device["port"] == str(port_no):
                         device["band"] = bandwidth_mbps
-                        self.logger.info(
+                        """ self.logger.info(
                             "Ancho de banda actualizado: switch=%s, puerto=%s, banda=%s Mbps",
                             switch_id, port_no, bandwidth_mbps
-                        )
+                        ) """
 
     @set_ev_cls(ofp_event.EventOFPStateChange, [CONFIG_DISPATCHER, MAIN_DISPATCHER])
     def _state_change_handler(self, ev):
@@ -290,11 +294,14 @@ class RyuManagerCustomSDN(app_manager.RyuApp):
         # Cálculo de latencia
         dpid = ev.msg.datapath.id
         latency = time.time() - self.load_balancer.echo_timestamps.get(dpid, time.time())
-        self.load_balancer.actualizar_latencia(dpid, latency)
+        self.load_balancer.actualizar_latencia(dpid)
         self.logger.info("Latencia actualizada: Switch %s - %.2f ms", dpid, latency*1000)
+        self.metrics["switch_latency"][dpid] = latency
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
+        self.logger.info("\n[DEBUG] Entró al handler PacketIn")
+        
         msg = ev.msg
         datapath = msg.datapath
         ofproto = datapath.ofproto
@@ -305,29 +312,65 @@ class RyuManagerCustomSDN(app_manager.RyuApp):
 
         pkt = packet.Packet(msg.data)
         eth_pkt = pkt.get_protocol(ethernet.ethernet)
-
         if eth_pkt is None:
-            return
+            return  # No ethernet header, ignorar
 
-        dst = eth_pkt.dst
         src = eth_pkt.src
-
+        dst = eth_pkt.dst
         in_port = msg.match['in_port']
-        self.logger.info("Packet in: DPID=%s, SRC=%s, DST=%s, IN_PORT=%s", dpid, src, dst, in_port)
 
-        if not eth_pkt.dst.startswith("ff:ff:ff:ff:ff:ff"):
-            self._register_device(dpid, in_port, eth_pkt.src, pkt)
+        self.logger.info("\nPacket in: DPID=%s, SRC=%s, DST=%s, IN_PORT=%s", dpid, src, dst, in_port)
 
+        # Aprender MAC para puerto entrante
         self.mac_to_port[dpid][src] = in_port
 
-        out_port = self.load_balancer.balancear_trafico(datapath, dst)
+        # Registrar dispositivo si no es broadcast/multicast
+        if not dst.startswith("ff:ff:ff:ff:ff:ff"):
+            self._register_device(dpid, in_port, src, pkt)
 
-        actions = [parser.OFPActionOutput(out_port)]
+        # Obtener puerto de salida con balanceador
+        self.logger.info(f"\n[Handler] Llamando a balancear_trafico para DPID {dpid}, destino {dst}")
+        self.load_balancer.enviar_echo_request(datapath)  # medir latencia (async)
+        self.logger.info(f"Latencia medida para DPID {dpid}: {self.load_balancer.echo_timestamps.get(dpid, 'N/A')}")
+        out_port = self.load_balancer.balancear_trafico(datapath, dst, in_port)
 
-        if out_port != ofproto.OFPP_FLOOD:
+        # Si el balanceador no decide puerto, usar FLOOD (broadcast)
+        if out_port is None:
+            out_port = ofproto.OFPP_FLOOD
+
+        #actions = [parser.OFPActionOutput(out_port)]
+
+        if out_port != ofproto.OFPP_FLOOD and out_port != ofproto.OFPP_LOCAL:
             match = parser.OFPMatch(in_port=in_port, eth_dst=dst, eth_src=src)
-            self.add_flow(datapath, 1, match, actions)
 
+            queue_id = self._asignar_cola(dpid, out_port)
+
+            actions = []
+            if queue_id is not None:
+                actions.append(parser.OFPActionSetQueue(queue_id))
+            actions.append(parser.OFPActionOutput(out_port))
+
+            self.add_flow(datapath, 1, match, actions)
+            self.logger.warning(f"[FLOOD] Enviando paquete sin flujo instalado para {dst}")
+
+            if queue_id is not None:
+                self.load_balancer._apply_qos(
+                    datapath=datapath,
+                    match_fields={
+                        "in_port": in_port,
+                        "eth_src": src,
+                        "eth_dst": dst
+                    },
+                    priority=10,
+                    queue_id=queue_id,
+                    out_port=out_port
+                )
+        else:
+            self.logger.info(f"[Handler] Usando FLOOD para DPID {dpid}, destino {dst}")
+            # Definir acciones solo como flood
+            actions = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
+
+        # Construir y enviar paquete de salida
         out = parser.OFPPacketOut(
             datapath=datapath,
             buffer_id=msg.buffer_id,
@@ -336,28 +379,67 @@ class RyuManagerCustomSDN(app_manager.RyuApp):
             data=msg.data if msg.buffer_id == ofproto.OFP_NO_BUFFER else None
         )
         datapath.send_msg(out)
-        
-        # Obtener IP destino si existe
+
+        # Extraer IP destino para logging
         dst_ip = 'N/A'
         ip_pkt = pkt.get_protocol(ipv4.ipv4)
         if ip_pkt:
             dst_ip = ip_pkt.dst
-        
-        # Registrar en CSV con contexto de paquete
+
+        # Registrar tráfico en CSV o base de datos
         self._log_traffic_data(
             dpid=dpid,
             port_stats=self.metrics["switches"].get(dpid, {}),
             dst_ip=dst_ip
         )
 
+    def _asignar_cola(self, dpid, out_port):
+        """
+        Asigna una cola basada en políticas por puerto o métricas dinámicas si están disponibles.
+
+        Args:
+            dpid (int): ID del switch.
+            out_port (int): Puerto de salida recomendado por el balanceador.
+
+        Returns:
+            int: ID de la cola a aplicar.
+        """
+        # Ignorar puertos virtuales al asignar colas
+        ofproto_v = self.datapaths[dpid].ofproto  # asegúrate de tener self.datapaths actualizado
+        if out_port in [0, ofproto_v.OFPP_LOCAL, 65534, "LOCAL", "local"]:
+            self.logger.info(f"[QoS] No se asigna cola a puerto virtual (out_port={out_port}) en switch {dpid}")
+            return 0  # o None
+
+        # Política estática por switch y puerto (puedes configurar aquí tus colas manualmente)
+        politica_estatica = {
+            1: { 2: 1, 3: 2 },  # Para switch 1: puerto 2 → cola 1, puerto 3 → cola 2
+            2: { 1: 1, 3: 2 },  # Para switch 2
+            3: { 1: 1, 2: 2 },  # Para switch 3
+        }
+
+        # Si tienes métricas dinámicas disponibles, podrías usarlas aquí:
+        uso_puerto = self.metrics["switches"].get(dpid, {}).get("ports", {}).get(out_port, {})
+        #latencia = self.load_balancer.actualizar_latencia(dpid)  # Obtener latencia actualizada
+        latencia = self.metrics["switches"].get(dpid, {}).get("ports", {}).get(out_port, {}).get("latencia")
+
+        # Lógica adicional: si el puerto está saturado (>50ms latencia), forzar cola baja prioridad
+        if latencia is not None and latencia > 199:
+            self.logger.info(f"[QoS] Puerto {out_port} del switch {dpid} con latencia {latencia}ms, usando cola 0")
+            return 0
+
+        # Política estática predeterminada
+        cola = politica_estatica.get(dpid, {}).get(out_port, 0)
+        self.logger.info(f"[QoS] Switch {dpid}, puerto {out_port} → asignando cola {cola}")
+        return cola
+
     def _register_device(self, dpid, port, mac, pkt):
         # Corrección para IPv4 (src_ip en lugar de src)
         ip = None
         for p in pkt.protocols:
             if isinstance(p, arp.arp):
-                ip = p.src_ip
+                ip = p.src_ip  # IP de origen del ARP
             elif isinstance(p, ipv4.ipv4):
-                ip = p.src_ip  # Corrección clave aquí
+                ip = "10.0.0." + str(random.randint(1, 4))  # Simulación de IP
             
         if ip:
             self.metrics["devices"].append({
@@ -371,13 +453,10 @@ class RyuManagerCustomSDN(app_manager.RyuApp):
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
         datapath = ev.msg.datapath
-        self.add_table_miss_flow(datapath)
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
-        
-        
-        self.load_balancer._apply_qos(datapath=datapath, match_fields={}, priority=1, queue_id=0)
 
+        # Install the table-miss flow entry.
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
                                           ofproto.OFPCML_NO_BUFFER)]
@@ -430,14 +509,16 @@ class RyuManagerCustomSDN(app_manager.RyuApp):
             })
 
             # Log (opcional)
-            self.logger.info(
+            """ self.logger.info(
                 "Switch %s, Port %s - TX: %d bytes (%d pkts), RX: %d bytes (%d pkts)",
                 dpid, port_no,
                 tx_bytes_diff, tx_pkts_diff,
                 rx_bytes_diff, rx_pkts_diff
-            )
+            ) """
 
     def add_table_miss_flow(self, datapath):
+        self.logger.info("Agregando flow table-miss para DPID=%s", datapath.id)
+
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
         match = parser.OFPMatch()  # Sin coincidencia, captura todo.
@@ -450,3 +531,7 @@ class RyuManagerCustomSDN(app_manager.RyuApp):
             instructions=inst
         )
         datapath.send_msg(mod)
+
+        self.logger.info("Table-miss flow instalado en switch %s", datapath.id)
+
+
