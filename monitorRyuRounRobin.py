@@ -17,6 +17,7 @@ class ExampleSwitch13(app_manager.RyuApp):
     def __init__(self, *args, **kwargs):
         super(ExampleSwitch13, self).__init__(*args, **kwargs)
         self.mac_to_port = {}
+        self.rr_index = {}  # Para balanceo Round Robin por switch
         self.metrics = {
             "switches": {},
             "switch_latency": {},
@@ -24,9 +25,9 @@ class ExampleSwitch13(app_manager.RyuApp):
             "memory": 0
         }
         self.echo_timestamps = {}
-        self.rr_index = {}  # Para balanceo Round Robin por switch
 
         # Lanzar hilo de monitoreo de CPU/Memoria
+        self.stats_thread = threading.Thread(target=self._stats_loop)
         self.monitor_thread = threading.Thread(target=self._monitor_loop)
         self.monitor_thread.daemon = True
         self.monitor_thread.start()
@@ -35,6 +36,12 @@ class ExampleSwitch13(app_manager.RyuApp):
         while True:
             self._log_system_stats()
             time.sleep(2)  # cada 2 segundos
+    def _stats_loop(self):
+        while True:
+            for dp in list(self.mac_to_port.keys()):
+                self.request_port_stats(dp)
+                self.send_echo_request(dp)
+            time.sleep(2)
 
     def _log_system_stats(self):
         cpu_usage = psutil.cpu_percent()
@@ -115,6 +122,7 @@ class ExampleSwitch13(app_manager.RyuApp):
         datapath = ev.msg.datapath
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
+        self.mac_to_port[datapath.id] = {}  # ✅ Diccionario para mapear MACs a puertos
 
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
@@ -124,12 +132,13 @@ class ExampleSwitch13(app_manager.RyuApp):
         self.request_port_stats(datapath)
         self.send_echo_request(datapath)
 
-    def add_flow(self, datapath, priority, match, actions):
+    def add_flow(self, datapath, priority, match, actions, idle_timeout=0, hard_timeout=0):
         parser = datapath.ofproto_parser
         ofproto = datapath.ofproto
         inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
         mod = parser.OFPFlowMod(datapath=datapath, priority=priority,
-                                match=match, instructions=inst)
+                                match=match, instructions=inst,
+                                idle_timeout=idle_timeout, hard_timeout=hard_timeout)
         datapath.send_msg(mod)
 
     def request_port_stats(self, datapath):
@@ -141,6 +150,29 @@ class ExampleSwitch13(app_manager.RyuApp):
         self.echo_timestamps[datapath.id] = time.time()
         echo_req = datapath.ofproto_parser.OFPEchoRequest(datapath, data=b'ping')
         datapath.send_msg(echo_req)
+
+    def balancear_trafico(self, datapath, dst_mac, in_port):
+        dpid = datapath.id
+        ofproto = datapath.ofproto
+
+        rr_data = self.rr_index.get(dpid)
+        if not rr_data or not rr_data.get("ports"):
+            self.logger.warning(f"[RR] No hay puertos disponibles para DPID {dpid}")
+            return None
+
+        ports_disponibles = [p for p in rr_data["ports"] if p != in_port and p != ofproto.OFPP_LOCAL]
+
+        if not ports_disponibles:
+            self.logger.warning(f"[RR] No hay puertos válidos para balanceo en DPID {dpid}")
+            return None
+
+        index = rr_data["index"] % len(ports_disponibles)
+        out_port = ports_disponibles[index]
+        self.rr_index[dpid]["index"] += 1
+
+        self.logger.info(f"[RR] DPID {dpid}: puerto seleccionado para {dst_mac} es {out_port}")
+        return out_port
+
 
     @set_ev_cls(ofp_event.EventOFPEchoReply, MAIN_DISPATCHER)
     def echo_reply_handler(self, ev):
@@ -159,14 +191,16 @@ class ExampleSwitch13(app_manager.RyuApp):
     @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
     def port_stats_reply_handler(self, ev):
         dpid = ev.msg.datapath.id
+        ofproto = ev.msg.datapath.ofproto
         self.metrics["switches"].setdefault(dpid, {})
-
         valid_ports = []
+
         for stat in ev.msg.body:
             port_no = stat.port_no
-            if port_no == ev.msg.datapath.ofproto.OFPP_LOCAL or port_no == 4294967294:
+
+            # Ignorar puertos inválidos o especiales
+            if port_no >= ofproto.OFPP_MAX or port_no == 4294967294:
                 continue
-            valid_ports.append(port_no)
 
             self.metrics["switches"][dpid][port_no] = {
                 "switch_id": dpid,
@@ -180,57 +214,69 @@ class ExampleSwitch13(app_manager.RyuApp):
                 "cpu_usage": self.metrics["cpu"],
                 "mem_usage": self.metrics["memory"]
             }
+            valid_ports.append(port_no)
 
-            self.logger.info("Switch %s Port %s - TX: %d bytes, RX: %d bytes, CPU: %.2f%%, MEM: %.2f%%",
-                             dpid, port_no, stat.tx_bytes, stat.rx_bytes,
-                             self.metrics["cpu"], self.metrics["memory"])
-        if dpid not in self.rr_index:
-            self.rr_index[dpid] = {"index": 0, "ports": valid_ports}
-        else:
-            self.rr_index[dpid]["ports"] = valid_ports
+        # Actualiza o inicializa lista y contador de puertos para balanceo round robin
+        if valid_ports:
+            if dpid not in self.rr_index:
+                self.rr_index[dpid] = {"ports": valid_ports, "index": 0}
+            else:
+                self.rr_index[dpid]["ports"] = valid_ports
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
+        self.logger.info("\n[DEBUG] Entró al handler PacketIn")
+        
         msg = ev.msg
         datapath = msg.datapath
-        parser = datapath.ofproto_parser
         ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+
         dpid = datapath.id
+        self.mac_to_port.setdefault(dpid, {})
 
         pkt = packet.Packet(msg.data)
         eth_pkt = pkt.get_protocol(ethernet.ethernet)
-        dst = eth_pkt.dst
-        src = eth_pkt.src
-
-        in_port = msg.match['in_port']
-        self.logger.info("packet in %s %s %s %s", dpid, src, dst, in_port)
-
-        # Balanceo de carga estático Round Robin
-        rr_info = self.rr_index.get(dpid)
-        if not rr_info or not rr_info["ports"]:
-            self.logger.warning("No hay puertos válidos para balanceo en el switch %s", dpid)
+        if eth_pkt is None:
             return
 
-        ports = rr_info["ports"]
-        out_port = ports[rr_info["index"] % len(ports)]
-        rr_info["index"] += 1
+        src = eth_pkt.src
+        dst = eth_pkt.dst
+        in_port = msg.match['in_port']
 
-        # Evitar que reenvíe al mismo puerto por donde llegó
-        if out_port == in_port:
-            out_port = ports[(rr_info["index"] % len(ports))]
-            rr_info["index"] += 1
+        self.logger.info("Packet in: DPID=%s, SRC=%s, DST=%s, IN_PORT=%s", dpid, src, dst, in_port)
 
-        actions = [parser.OFPActionOutput(out_port)]
+        # Aprender dirección MAC del origen
+        self.mac_to_port[dpid][src] = in_port
 
-        # Opcional: instalar flujo si no es broadcast
-        match = parser.OFPMatch(in_port=in_port, eth_dst=dst)
-        self.add_flow(datapath, 1, match, actions)
+        # Determinar puerto de salida
+        out_port = self.mac_to_port[dpid].get(dst)
 
+        if out_port is None:
+            self.logger.info(f"[RR] Puerto de salida para {dst} desconocido, usando Round Robin")
+            self.send_echo_request(datapath)
+            out_port = self.balancear_trafico(datapath, dst, in_port)
+
+            if out_port is None:
+                self.logger.info(f"[RR] balancear_trafico no devolvió puerto → usando FLOOD")
+                out_port = ofproto.OFPP_FLOOD
+
+        if out_port != ofproto.OFPP_FLOOD:
+            # Instalar flujo solo si es puerto válido, con timeout para que expire
+            match = parser.OFPMatch(in_port=in_port, eth_src=src, eth_dst=dst)
+            actions = [parser.OFPActionOutput(out_port)]
+            self.add_flow(datapath, 1, match, actions, idle_timeout=5, hard_timeout=10)
+            self.logger.info(f"[FLOW] Instalado flujo {src} → {dst} por puerto {out_port} con timeouts")
+        else:
+            actions = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
+            self.logger.info(f"[FLOOD] FLOOD para {dst}")
+
+        # Enviar paquete de salida
         out = parser.OFPPacketOut(
             datapath=datapath,
-            buffer_id=ofproto.OFP_NO_BUFFER,
+            buffer_id=msg.buffer_id,
             in_port=in_port,
             actions=actions,
-            data=msg.data
+            data=msg.data if msg.buffer_id == ofproto.OFP_NO_BUFFER else None
         )
         datapath.send_msg(out)
